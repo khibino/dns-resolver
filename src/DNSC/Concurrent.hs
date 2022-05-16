@@ -14,7 +14,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import System.IO.Error (tryIOError)
 
 -- dns packages
-import Control.Concurrent.Async (async, wait)
+import Control.Concurrent.Async (replicateConcurrently_, mapConcurrently_)
 
 
 forkConsumeQueue :: (a -> IO ())
@@ -39,9 +39,7 @@ forksConsumeQueueWith n onError body = do
       issueQuit = replicateM_ n $ writeChan inQ Nothing
       hbody = either onError return <=< tryIOError . body
       loop = maybe (return ()) ((*> loop) . hbody) =<< readChan inQ
-
-  waitQuit <- forksWithWait $ replicate n loop
-  return (enqueue, issueQuit *> waitQuit)
+  return (enqueue, issueQuit *> replicateConcurrently_ n loop)
 
 forksLoopWith :: (IOError -> IO ()) -> [IO ()] -> IO (IO ())
 forksLoopWith onError bodies = do
@@ -50,11 +48,4 @@ forksLoopWith onError bodies = do
       loop body = do
         isQuit <- readIORef qref
         unless isQuit $ handle body *> loop body
-  waitQuit <- forksWithWait $ map loop bodies
-  return $ writeIORef qref True *> waitQuit
-
-forksWithWait :: [IO ()] -> IO (IO ())
-forksWithWait bodies = do
-  ts <- mapM async bodies
-  let waitQuit = mapM_ wait ts
-  return waitQuit
+  return $ writeIORef qref True *> mapConcurrently_ loop bodies
