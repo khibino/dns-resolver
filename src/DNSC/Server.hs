@@ -5,7 +5,9 @@ module DNSC.Server (
   ) where
 
 -- GHC packages
+import Control.Applicative ((<|>))
 import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent.STM (STM, atomically)
 import Control.Monad ((<=<), forever, replicateM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (runExceptT, throwE)
@@ -22,9 +24,9 @@ import qualified Network.DNS as DNS
 import UnliftIO (SomeException, tryAny, concurrently_, race_)
 
 -- this package
-import DNSC.Queue (newQueue, readQueue, writeQueue, TQ)
+import DNSC.Queue (newQueue, readQueue, writeQueue, TQ, waitReadQueueSTM, waitWriteQueueSTM)
 import qualified DNSC.Queue as Queue
-import DNSC.SocketUtil (addrInfo, isAnySockAddr)
+import DNSC.SocketUtil (addrInfo, isAnySockAddr, mkSocketWaitReadSTM, mkSocketWaitWriteSTM)
 import DNSC.DNSUtil (mkRecvBS, mkSendBS)
 import DNSC.ServerMonitor (monitor, PLStatus)
 import qualified DNSC.ServerMonitor as Mon
@@ -91,8 +93,19 @@ getPipeline workers sharedQueue perWorker getSec cxt sock_ addr_ = do
       send bs (peer, cmsgs) = mkSendBS wildcard sock_ bs peer cmsgs
       recv = mkRecvBS wildcard sock_
 
-  (workerPipelines, enqueueReq, dequeueResp) <- getWorkers workers sharedQueue perWorker getSec cxt
+  (workerPipelines, waitReqQ, enqueueReq, waitResQ, dequeueResp) <- getWorkers workers sharedQueue perWorker getSec cxt
   (workerLoops, getsStatus) <- unzip <$> sequence workerPipelines
+
+  let getWaitRequest  = do
+        waitReadable <- mkSocketWaitReadSTM sock_
+        return $ waitReadable *> waitReqQ
+  let getWaitResponse = do
+        waitWriteable <- mkSocketWaitWriteSTM sock_
+        return $ waitResQ *> waitWriteable
+
+  let rrLoop = evReqRespLoop (putLn Log.NOTICE . ("Server.reqResp: error: " ++) . show)
+               (getWaitRequest, enqueueReq =<< recv)
+               (getWaitResponse, uncurry send =<< dequeueResp)
 
   let reqLoop = handledLoop (putLn Log.NOTICE . ("Server.recvRequest: error: " ++) . show)
                 $ recvRequest recv cxt enqueueReq
@@ -100,14 +113,19 @@ getPipeline workers sharedQueue perWorker getSec cxt sock_ addr_ = do
   let respLoop = readLoop dequeueResp (putLn Log.NOTICE . ("Server.sendResponse: error: " ++) . show)
                  $ sendResponse send cxt
 
-  return (respLoop : concat workerLoops ++ [reqLoop], getsStatus)
+  let schedRecvSend = True
+      rrLoops
+        | schedRecvSend  =  [rrLoop]
+        | otherwise      =  [respLoop, reqLoop]
+
+  return (concat workerLoops ++ rrLoops, getsStatus)
 
 type WorkerStatus = (IO (Int, Int), IO (Int, Int), IO (Int, Int), IO Int, IO Int, IO Int)
 
 getWorkers :: Show a
            => Int -> Bool -> Int
            -> IO Timestamp -> Context
-           -> IO ([IO ([IO ()], WorkerStatus)], Request a -> IO (), IO (Response a))
+           -> IO ([IO ([IO ()], WorkerStatus)], STM (), Request a -> IO (), STM (), IO (Response a))
 getWorkers workers sharedQueue perWorker getSec cxt
   | sharedQueue  =  do
       let qsize = perWorker * workers
@@ -115,15 +133,17 @@ getWorkers workers sharedQueue perWorker getSec cxt
       resQ <- newQueue qsize
       {- share request queue and response queue -}
       let wps = replicate workers $ workerPipeline reqQ resQ perWorker getSec cxt
-      return (wps, writeQueue reqQ, readQueue resQ)
+      return (wps, waitWriteQueueSTM reqQ, writeQueue reqQ, waitReadQueueSTM resQ, readQueue resQ)
   | otherwise    =  do
       reqQs <- replicateM workers $ newQueue perWorker
-      enqueueReq  <- Queue.writeQueue <$> Queue.makePutAny reqQs
+      reqPutAny <- Queue.makePutAny reqQs
       resQs <- replicateM workers $ newQueue perWorker
-      dequeueResp <- Queue.readQueue  <$> Queue.makeGetAny resQs
+      respGetAny <- Queue.makeGetAny resQs
       let wps = [ workerPipeline reqQ resQ perWorker getSec cxt
                 | reqQ <- reqQs | resQ <- resQs ]
-      return (wps, enqueueReq, dequeueResp)
+      return (wps,
+              waitWriteQueueSTM reqPutAny, Queue.writeQueue reqPutAny,
+              waitReadQueueSTM respGetAny, Queue.readQueue respGetAny)
 
 workerPipeline :: Show a
                => TQ (Request a) -> TQ (Response a)
@@ -205,6 +225,25 @@ sendResponse :: (ByteString -> a -> IO ())
              -> Context
              -> Response a -> IO ()
 sendResponse send _cxt (bs, addr) = send bs addr
+
+evReqRespLoop :: (SomeException -> IO ())
+              -> (IO (STM ()), IO ())
+              -> (IO (STM ()), IO ())
+              -> IO ()
+evReqRespLoop onError (getWaitReq, recvEnq) (getWaitResp, deqSend) = forever $ do
+  runs mkRecvReq mkSendResp
+  runs mkSendResp mkRecvReq
+  where
+    runs getS1 getS2 = either onError return <=< tryAny $ do
+      s1 <- getS1
+      s2 <- getS2
+      action <- atomically $ s1 <|> s2
+      action
+    mkRecvReq  = mkTry getWaitReq  recvEnq
+    mkSendResp = mkTry getWaitResp deqSend
+    mkTry getWait action = do
+      wait <- getWait
+      return $ wait *> pure action
 
 ---
 
