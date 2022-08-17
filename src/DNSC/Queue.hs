@@ -11,7 +11,7 @@ module DNSC.Queue (
   PutAny, makePutAny,
   ) where
 
-import Control.Monad (guard, msum, when)
+import Control.Monad (guard, msum, when, (<=<))
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Concurrent.STM
   (TVar, newTVar, readTVar, modifyTVar', writeTVar,
@@ -31,9 +31,11 @@ class QueueSize q where
   readSizes :: q a -> IO (Int, Int)
 
 class ReadQueueSTM q where
+  waitReadQueueSTM :: q a -> STM ()
   readQueueSTM :: q a -> STM a
 
 class WriteQueueSTM q where
+  waitWriteQueueSTM :: q a -> STM ()
   writeQueueSTM :: q a -> a -> STM ()
 
 ---
@@ -45,7 +47,7 @@ makeReadSizesAny qs = do
 
 data GetAny a =
   GetAny
-  { getAnyCycle :: TVar [STM a]
+  { getAnyCycle :: TVar [(STM (), STM a)]
   , getAnyQueues :: Int
   , getAnyMaxBound :: Int
   , getAnyReadSizes :: IO (Int, Int)
@@ -59,12 +61,17 @@ makeGetAny qs = atomically $ do
   <*> pure (sum $ map sizeMaxBound qs)
   <*> pure (makeReadSizesAny qs)
   where
-    c = cycle [ readQueueSTM q | q <- qs]
+    c = cycle [ (waitReadQueueSTM q, readQueueSTM q) | q <- qs]
+
+readableAnySTM :: GetAny a -> STM ()
+readableAnySTM getA = do
+  gs <- readTVar $ getAnyCycle getA
+  msum [ wait | (wait, _) <- take (getAnyQueues getA) gs ]
 
 getAnySTM :: GetAny a -> STM a
 getAnySTM getA = do
   gs <- readTVar $ getAnyCycle getA
-  a  <- msum $ take (getAnyQueues getA) gs
+  a  <- msum [ get | (_, get) <- take (getAnyQueues getA) gs ]
   let z = tail gs
   z `seq` writeTVar (getAnyCycle getA) z
   return a
@@ -74,6 +81,7 @@ instance QueueSize GetAny where
   readSizes = getAnyReadSizes
 
 instance ReadQueueSTM GetAny where
+  waitReadQueueSTM = readableAnySTM
   readQueueSTM = getAnySTM
 
 instance ReadQueue GetAny where
@@ -81,7 +89,7 @@ instance ReadQueue GetAny where
 
 data PutAny a =
   PutAny
-  { putAnyCycle :: TVar [a -> STM ()]
+  { putAnyCycle :: TVar [(STM (), a -> STM ())]
   , putAnyQueues ::Int
   , putAnyMaxBound :: Int
   , putAnyReadSizes :: IO (Int, Int)
@@ -95,12 +103,17 @@ makePutAny qs = atomically $ do
   <*> pure (sum $ map sizeMaxBound qs)
   <*> pure (makeReadSizesAny qs)
   where
-    c = cycle [ writeQueueSTM q | q <- qs ]
+    c = cycle [ (waitWriteQueueSTM q, writeQueueSTM q) | q <- qs ]
+
+writableAnySTM :: PutAny a -> STM ()
+writableAnySTM putA = do
+  ps <- readTVar $ putAnyCycle putA
+  msum [ wait | (wait, _) <- take (putAnyQueues putA) ps ]
 
 putAnySTM :: PutAny a -> a -> STM ()
 putAnySTM putA a = do
   ps <- readTVar $ putAnyCycle putA
-  msum [ put a | put <- take (putAnyQueues putA) ps ]
+  msum [ put a | (_, put) <- take (putAnyQueues putA) ps ]
   let z = tail ps
   z `seq` writeTVar (putAnyCycle putA) z
 
@@ -109,6 +122,7 @@ instance QueueSize PutAny where
   readSizes = putAnyReadSizes
 
 instance WriteQueueSTM PutAny where
+  waitWriteQueueSTM = writableAnySTM
   writeQueueSTM = putAnySTM
 
 instance WriteQueue PutAny where
@@ -130,6 +144,11 @@ newQueue = atomically . newTQ
 newTQ :: Int -> STM (TQ a)
 newTQ xsz = TQ <$> newTQueue <*> newTVar 0 <*> newTVar 0 <*> pure xsz
 
+readableTQ :: TQ a -> STM ()
+readableTQ q = do
+  sz <- readTVar $ tqSizeRef q
+  guard $ sz > 0
+
 readTQ :: TQ a -> STM a
 readTQ q = do
   x <- readTQueue $ tqContent q
@@ -144,6 +163,11 @@ readTQ q = do
       let lastMaxRef = tqLastMaxSizeRef q
       mx <- readTVar lastMaxRef
       when (sz > mx) $ writeTVar lastMaxRef sz
+
+writeableTQ :: TQ a -> STM ()
+writeableTQ q = do
+  sz <- readTVar $ tqSizeRef q
+  guard $ sz < tqSizeMaxBound q
 
 writeTQ :: TQ a -> a -> STM ()
 writeTQ q x = do
@@ -170,9 +194,11 @@ instance QueueSize TQ where
   readSizes = atomically . readSizesTQ
 
 instance ReadQueueSTM TQ where
+  waitReadQueueSTM = readableTQ
   readQueueSTM = readTQ
 
 instance WriteQueueSTM TQ where
+  waitWriteQueueSTM = writeableTQ
   writeQueueSTM = writeTQ
 
 ---
@@ -211,7 +237,9 @@ instance QueueSize TMVar where
     where emptySize empty = if empty then 0 else 1
 
 instance ReadQueueSTM TMVar where
+  waitReadQueueSTM = guard . not <=< isEmptyTMVar
   readQueueSTM = takeTMVar
 
 instance WriteQueueSTM TMVar where
+  waitWriteQueueSTM = guard <=< isEmptyTMVar
   writeQueueSTM = putTMVar
