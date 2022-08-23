@@ -1,5 +1,6 @@
 module DNSC.SocketUtil (
   addrInfo,
+  mkSocketWaitReadSTM, mkSocketWaitWriteSTM,
   mkSocketWaitForByte,
   isAnySockAddr,
   ) where
@@ -9,7 +10,10 @@ import GHC.IO.Device (IODevice (ready))
 import GHC.IO.FD (mkFD)
 
 -- GHC packages
+import Control.Concurrent (threadWaitReadSTM, threadWaitWriteSTM)
+import Control.Concurrent.STM (STM)
 import System.IO (IOMode (ReadMode))
+import System.Posix.Types (Fd (Fd))
 
 -- dns packages
 import Network.Socket (AddrInfo (..), HostName, PortNumber, Socket, SockAddr (..))
@@ -19,6 +23,12 @@ import qualified Network.Socket as S
 addrInfo :: PortNumber -> [HostName] -> IO [AddrInfo]
 addrInfo p []        = S.getAddrInfo Nothing Nothing $ Just $ show p
 addrInfo p hs@(_:_)  = concat <$> sequence [ S.getAddrInfo Nothing (Just h) $ Just $ show p | h <- hs ]
+
+mkSocketWaitReadSTM :: Socket -> IO (STM ())
+mkSocketWaitReadSTM sock = S.withFdSocket sock $ fmap fst . threadWaitReadSTM . Fd
+
+mkSocketWaitWriteSTM :: Socket -> IO (STM ())
+mkSocketWaitWriteSTM sock = S.withFdSocket sock $ fmap fst . threadWaitWriteSTM . Fd
 
 {- make action to wait for socket-input from cached FD
    without calling fdStat and mkFD for every wait-for calls -}
