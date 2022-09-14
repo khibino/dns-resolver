@@ -32,11 +32,13 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT (..), runExceptT, throwE)
 import Control.Monad.Trans.Reader (ReaderT (..), asks)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as B8
 import Data.ByteString.Short (ShortByteString)
 import qualified Data.ByteString.Short as Short
 import Data.Function (on)
 import Data.Int (Int64)
+import Data.Word (Word8, Word16)
 import Data.Maybe (listToMaybe, isJust)
 import Data.List (unfoldr, uncons, groupBy, sortOn, sort, intercalate)
 import Data.Word8
@@ -556,7 +558,7 @@ resolveLogic logMark cnameHandler typeHandler n0 typ =
 {- CNAME のレコードを取得し、キャッシュする -}
 resolveCNAME :: Domain -> DNSQuery DNSMessage
 resolveCNAME bn = do
-  (msg, _nss@(srcDom, _)) <- resolveJust bn CNAME
+  (msg, _nss@(srcDom, _, _)) <- resolveJust bn CNAME
   lift $ cacheAnswer srcDom bn CNAME msg
   return msg
 
@@ -566,7 +568,7 @@ resolveCNAME bn = do
 resolveTYPE :: Domain -> TYPE
             -> DNSQuery (DNSMessage, Maybe (Domain, ResourceRecord))  {- result msg and cname RR involved in -}
 resolveTYPE bn typ = do
-  (msg, _nss@(srcDom, _)) <- resolveJust bn typ
+  (msg, _nss@(srcDom, _, _)) <- resolveJust bn typ
   cname <- lift $ getSectionWithCache rankedAnswer refinesCNAME msg
   let checkTypeRR =
         when (any ((&&) <$> (== bn) . rrname <*> (== typ) . rrtype) $ DNS.answer msg) $
@@ -613,8 +615,10 @@ resolveJustDC dc n typ
     where
       mdc = maxNotSublevelDelegation
 
+type DSData = (Word16, Word8, Word8, ByteString)
 -- ドメインに対する NS 委任情報
-type Delegation = (Domain, NE DEntry)
+type Delegation = (Domain, NE DEntry, Maybe DSData)
+
 
 data DEntry
   = DEwithAx !Domain !IP
@@ -668,11 +672,14 @@ iterative_ dc nss (x:xs) =
     lookupNX = isJust <$> lookupCache name Cache.nxTYPE
 
     stepQuery :: Delegation -> DNSQuery (Maybe Delegation)  -- Nothing のときは委任情報無し
-    stepQuery nss_@(srcDom, _) = do
+    stepQuery nss_@(srcDom, _, _) = do
       sa <- selectDelegation dc nss_  -- 親ドメインから同じ NS の情報が引き継がれた場合も、NS のアドレスを選択しなおすことで balancing する.
       lift $ logLn Log.INFO $ "iterative: norec: " ++ show (sa, name, A)
       msg <- norec sa name A
-      lift $ delegationWithCache srcDom name msg
+      dg <- lift $ delegationWithCache srcDom name msg
+      dsMsg <- norec sa name DNS.DS
+      liftIO $ putStrLn $ "dsMsg: " ++ show (DNS.answer dsMsg)
+      return dg
 
     step :: Delegation -> DNSQuery (Maybe Delegation)  -- Nothing のときは委任情報無し
     step nss_ = do
@@ -706,7 +713,7 @@ lookupDelegation dom = do
       fromDEs es
         | noCachedV4NS es  =  Nothing
         {- all NS records for A are skipped under disableV6NS, so handle as miss-hit NS case -}
-        | otherwise        =  (Just . (,) dom) <$> uncons es
+        | otherwise        =  fmap Just $ (,,) dom <$> uncons es <*> pure Nothing {- FIX: lookup DS -}
         {- Nothing case, all NS records are skipped, so handle as miss-hit NS case -}
       getDelegation :: ([ResourceRecord], a) -> ReaderT Context IO (Maybe (Maybe Delegation))
       getDelegation (rrs, _) = do {- NS cache hit -}
@@ -757,7 +764,7 @@ takeDelegation nsps adds = do
   (p@(_, rr), ps) <- uncons nsps
   let nss = map fst (p:ps)
   ents <- uncons $ concatMap (uncurry dentries) $ nsPairs (sort nss) addgroups
-  return (rrname rr, ents)
+  return (rrname rr, ents, Nothing {- FIX: Fill DS -})
   where
     addgroups = groupBy ((==) `on` rrname) $ sortOn ((,) <$> rrname <*> rrtype) adds
     nsPairs []     _gs            =  []
@@ -813,7 +820,7 @@ norec aserver name typ = dnsQueryT $ \cxt -> do
 -- Select an authoritative server from the delegation information and resolve to an IP address.
 -- If the resolution result is NODATA, IllegalDomain is returned.
 selectDelegation :: Int -> Delegation -> DNSQuery IP
-selectDelegation dc (srcDom, des) = do
+selectDelegation dc (srcDom, des, _) = do
   disableV6NS <- lift $ asks disableV6NS_
   let failEmptyDEs = do
         lift $ logLn Log.INFO $ "selectDelegation: server-fail: domain: " ++ show srcDom ++ ", delegation is empty."
