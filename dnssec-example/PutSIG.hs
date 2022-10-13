@@ -8,17 +8,18 @@ module PutSIG where
 import GHC.Generics (Generic)
 import Data.Int (Int64)
 import Data.Word (Word8, Word16, Word32)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as LB
 
--- dns
+-- dnsext
 import Data.IP (IPv4, fromIPv4, IPv6, fromIPv6b)
-import Network.DNS (Domain, TYPE, fromTYPE, RData(..), ResourceRecord (..))
-import qualified Network.DNS as DNS
+import DNS.Types (Domain, Mailbox, TYPE (..), fromTYPE, ResourceRecord (..), RData)
+import DNS.Types.Internal (SPut, put8, put16, put32, putInt8, putSeconds, ResourceData (..), addBuilderPosition, putRData, CanonicalFlag (..))
+
+import qualified DNS.Types as DNS
 
 -- local
-import StatePut (SPut, put8, put16, put32, putInt8, putByteString, putDomainNC, putMailboxNC, addPositionW)
+import StatePut (putDomainNC, putMailboxNC)
 import StatePutGeneric (SPutI (sPut), genericSPut)
 
 
@@ -39,14 +40,8 @@ instance SPutI Word32 where
 instance SPutI Int64 where
   sPut = put32 . fromIntegral
 
-instance SPutI ByteString where
-  sPut = putByteString
-
 instance SPutI DNS.OData where
   sPut = error "SPutI.sPut: OData: must not happen"
-
-instance SPutI DNS.RD_RRSIG where
-  sPut = error "SPutI.sPut: RRSIG: must not happen"
 
 instance SPutI a => SPutI [a] where
   sPut = mconcat . map sPut
@@ -83,38 +78,56 @@ rrsigZone = snd
 putRRSIG_HEADER :: RRSIG_HEADER -> SPut
 putRRSIG_HEADER (meta, sn) = genericSPut meta <> putDomainNC sn
 
-deriving instance Generic RData
+---
 
-putRData :: RData -> SPut
-putRData rd = case rd of
-  RD_NS                nsdname -> putDomainNC nsdname
-  RD_CNAME               cname -> putDomainNC cname
-  RD_SOA       mn mr a b c d e -> putDomainNC mn <> putMailboxNC mr <> sPut [a, b, c, d, e]
-  RD_PTR              ptrdname -> putDomainNC ptrdname
-  RD_MX              pref exch -> mconcat [put16 pref, putDomainNC exch]
-  RD_DNAME                  {} -> undefined
-  RD_OPT                    {} -> error "putRData.RD_OPT: must not happen"
-  RD_DS                     {} -> error "putRData.RD_DS: must not happen"
-  RD_CDS                    {} -> error "putRData.RD_CDS: must not happen"
-  RD_RRSIG                  {} -> error "putRData.RD_RRSIG: must not happen"
-  RD_NSEC                   {} -> undefined
-  RD_NSEC3                  {} -> undefined
+{- instances without Name Compression -}
+newtype RD_NS = RD_NS Domain deriving (Eq, Ord)
+instance ResourceData RD_NS where
+  resourceDataType _ = NS
+  putResourceData _ (RD_NS d) = putDomainNC d
+  getResourceData = error "getResourceData: unused in dnssec-example"
+instance Show RD_NS where show (RD_NS d) = show d
 
-  _others                      -> genericSPut rd
+newtype RD_CNAME = RD_CNAME Domain deriving (Eq, Ord)
+instance ResourceData RD_CNAME where
+  resourceDataType _ = CNAME
+  putResourceData _ (RD_CNAME d) = putDomainNC d
+  getResourceData = error "getResourceData: unused in dnssec-example"
+instance Show RD_CNAME where show (RD_CNAME d) = show d
+
+data RD_SOA = RD_SOA Domain Mailbox Word32 Word32 Word32 Word32 Word32 deriving (Eq, Ord, Show)
+instance ResourceData RD_SOA where
+  resourceDataType _ = SOA
+  putResourceData _ (RD_SOA mn rn a b c d e) =
+    mconcat [putDomainNC mn, putMailboxNC rn, put32 a, put32 b, put32 c, put32 d, put32 e]
+  getResourceData = error "getResourceData: unused in dnssec-example"
+
+newtype RD_PTR = RD_PTR Domain deriving (Eq, Ord)
+instance ResourceData RD_PTR where
+  resourceDataType _ = PTR
+  putResourceData _ (RD_PTR d) = putDomainNC d
+  getResourceData = error "getResourceData: unused in dnssec-example"
+instance Show RD_PTR where show (RD_PTR d) = show d
+
+data RD_MX = RD_MX Word16 Domain deriving (Eq, Ord, Show)
+instance ResourceData RD_MX where
+  resourceDataType _ = MX
+  putResourceData _ (RD_MX pref exch) = put16 pref <> putDomainNC exch
+  getResourceData = error "getResourceData: unused in dnssec-example"
 
 putResourceRecordNC :: ResourceRecord -> SPut
 putResourceRecordNC rr = mconcat [
     putDomainNC $ rrname rr
   , put16 (fromTYPE $ rrtype rr)
   , put16 $ rrclass rr
-  , put32 $ rrttl rr
+  , putSeconds $ rrttl rr
   , putResourceRData $ rdata rr
   ]
   where
     putResourceRData :: RData -> SPut
     putResourceRData rd = do
-        addPositionW 2 -- "simulate" putInt16
-        rDataBuilder <- putRData rd
+        addBuilderPosition 2 -- "simulate" putInt16
+        rDataBuilder <- putRData Canonical rd
         let rdataLength = fromIntegral . LB.length . BB.toLazyByteString $ rDataBuilder
         let rlenBuilder = BB.int16BE rdataLength
         return $ rlenBuilder <> rDataBuilder
