@@ -21,11 +21,11 @@ import Crypto.Hash (Digest, hashWith)
 import Crypto.Hash.Algorithms (SHA256 (..))
 
 -- dns
-import Network.DNS (ResourceRecord (..), TYPE (A, AAAA))
-import qualified Network.DNS as DNS
+import DNS.Types (ResourceRecord (..), TYPE (A, AAAA))
+import qualified DNS.Types as DNS
+import DNS.Types.Internal (runSPut)
 
 -- local
-import StatePut (runSPut)
 import PutSIG (RRSIG_META (..), RRSIG_HEADER, putRRSIG_HEADER, putResourceRecordNC)
 
 
@@ -121,11 +121,11 @@ bsDump = concatMap (printf "%02x") . BS.unpack
 
 ---
 
-checkRRSIG :: PKCS1 -> ByteString -> ByteString -> RRSIG_HEADER -> ResourceRecord -> Either String String
-checkRRSIG pkcs1 zskB64 sigB64 rrsigH rr = do
+verifyRRSIG :: PKCS1 -> ByteString -> ByteString -> RRSIG_HEADER -> ResourceRecord -> Either String String
+verifyRRSIG pkcs1 zskB64 sigB64 rrsigH rr = do
   dec <- decodeSig pkcs1 zskB64 sigB64
   let sig = sha256sumBS $ runSPut $ putRRSIG_HEADER rrsigH <> putResourceRecordNC rr
-  when (dec /= sig) $ Left  $ unlines ["checkRRSIG: signature mismatch:", bsDump dec, "  =/=", bsDump sig]
+  when (dec /= sig) $ Left  $ unlines ["verifyRRSIG: signature mismatch:", bsDump dec, "  =/=", bsDump sig]
   Right $ "Good: " ++ bsDump sig
 
 ---
@@ -219,7 +219,7 @@ rrsigHeaderEngA =
     , rrsigInception  = getRRSIGTimeInt' "20221003151005"
     , rrsigKeyTag = 34908
     },
-    B8.pack "iij.ad.jp.")
+    fromString "iij.ad.jp.")
 
 b64EncSigEngA :: ByteString
 b64EncSigEngA = B8.pack "QEv8fD6+zGWJxVRwXN/4OQP/fJWjb8+zeKugVYdvGClgrFssNUTcx8SU yoPbRrW+xqZePxp7i1yGfBapZVq94mCR/x9W88gT5zl0pZ+pAAbfmg9a WD+/UU+27MgJxZFdHXIxBHSvoDHxsA4RihACCT9drk+Sueg2MbbwU38d dGM="
@@ -237,7 +237,7 @@ rrsigHeaderEngAAAA =
     , rrsigInception  = getRRSIGTimeInt' "20221003151005"
     , rrsigKeyTag = 34908
     },
-    B8.pack "iij.ad.jp.")
+    fromString "iij.ad.jp.")
 
 b64EncSigEngAAAA :: ByteString
 b64EncSigEngAAAA = B8.pack "g9al6v3uVnOkZeoLW24A80XUgKlECu+AaGJu+eZlhKZ8iHc+NEJAaa8l V4JY5Ty0p8qmBav4Wpvxt2w89q6qSg8C9y3tojPl6lwBTcVf8SqWUJGL QSv8o2T+N7Yq6Q4slQeP09W8aNdmW7ihAHqPIyN80VNTfNhVOk7bOBLR ESs="
@@ -272,7 +272,7 @@ decodedEngAAAA2 = bsDump <$> decodeSig PKCS1SHA256 b64IijZsk2 b64EncSigEngAAAA
 
 -- eng-blog.iij.ad.jp.  300  IN  A  202.232.2.183
 rrEngA :: ResourceRecord
-rrEngA = ResourceRecord { rrname = fromString "eng-blog.iij.ad.jp.", rrttl = 300, rrclass = DNS.classIN, rrtype = A, rdata = DNS.RD_A $ read "202.232.2.183" }
+rrEngA = ResourceRecord { rrname = fromString "eng-blog.iij.ad.jp.", rrttl = 300, rrclass = DNS.classIN, rrtype = A, rdata = DNS.rd_a $ read "202.232.2.183" }
 
 sigArgEngA :: ByteString
 sigArgEngA = runSPut $ putRRSIG_HEADER rrsigHeaderEngA <> putResourceRecordNC rrEngA
@@ -280,12 +280,12 @@ sigArgEngA = runSPut $ putRRSIG_HEADER rrsigHeaderEngA <> putResourceRecordNC rr
 sigEngA :: String
 sigEngA = bsDump $ sha256sumBS sigArgEngA
 
-checkEngA :: Either String String
-checkEngA = checkRRSIG PKCS1SHA256 b64IijZsk2 b64EncSigEngA rrsigHeaderEngA rrEngA
+verifyEngA :: Either String String
+verifyEngA = verifyRRSIG PKCS1SHA256 b64IijZsk2 b64EncSigEngA rrsigHeaderEngA rrEngA
 
 -- eng-blog.iij.ad.jp.  300  IN  AAAA  2001:240:bb81::10:183
 rrEngAAAA :: ResourceRecord
-rrEngAAAA = ResourceRecord { rrname = fromString "eng-blog.iij.ad.jp.", rrttl = 300, rrclass = DNS.classIN, rrtype = AAAA, rdata = DNS.RD_AAAA $ read "2001:240:bb81::10:183" }
+rrEngAAAA = ResourceRecord { rrname = fromString "eng-blog.iij.ad.jp.", rrttl = 300, rrclass = DNS.classIN, rrtype = AAAA, rdata = DNS.rd_aaaa $ read "2001:240:bb81::10:183" }
 
 sigArgEngAAAA :: ByteString
 sigArgEngAAAA = runSPut $ putRRSIG_HEADER rrsigHeaderEngAAAA <> putResourceRecordNC rrEngAAAA
@@ -293,5 +293,5 @@ sigArgEngAAAA = runSPut $ putRRSIG_HEADER rrsigHeaderEngAAAA <> putResourceRecor
 sigEngAAAA :: String
 sigEngAAAA = bsDump $ sha256sumBS sigArgEngAAAA
 
-checkEngAAAA :: Either String String
-checkEngAAAA = checkRRSIG PKCS1SHA256 b64IijZsk2 b64EncSigEngAAAA rrsigHeaderEngAAAA rrEngAAAA
+verifyEngAAAA :: Either String String
+verifyEngAAAA = verifyRRSIG PKCS1SHA256 b64IijZsk2 b64EncSigEngAAAA rrsigHeaderEngAAAA rrEngAAAA
